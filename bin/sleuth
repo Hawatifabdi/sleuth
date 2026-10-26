@@ -1,0 +1,297 @@
+#!/usr/bin/env bash
+# NetSleuth: Linux network diagnostics toolkit. Bash 4+.
+set -uo pipefail
+IFS=$'\n\t'
+VERSION="1.2.0"
+SOURCE_PATH="$(readlink -f -- "${BASH_SOURCE[0]}")" || { printf 'Error: cannot resolve script path.\n' >&2; exit 2; }
+SCRIPT_DIR="$(cd "$(dirname "$SOURCE_PATH")/.." && pwd)"
+TARGET_INPUT=""; TARGET=""; SCHEME="http"; URL_PATH="/"; PORT=""; CIDR=""; SAVE_REPORT=false; JSON_MODE=false
+GW_IP=""; GW_DEV=""; GW_OK="unknown"; DNS_LOCAL_OK="unknown"; DNS_PUBLIC_OK="unknown"
+PING_OK="unknown"; TCP_OK="unknown"; TCP_ERR="none"; HTTP_CODE="000"; HTTP_TIME="0.000"
+TLS_STATUS="not_checked"; TLS_VERSION=""; TLS_CIPHER=""; TLS_DAYS_LEFT=""; TLS_ERROR=""
+URL_EXPLICIT=false
+REPORT_TEXT=""
+usage() { cat <<'HELP'
+Usage: sleuth [OPTIONS] TARGET
+TARGET may be a hostname, IPv4 address, http:// URL, or https:// URL.
+Options:
+  -p, --port PORT       Override target port (1-65535)
+  -c, --cidr CIDR       Calculate an IPv4 subnet and exit (address/prefix required)
+  -s, --save-report     Save a timestamped text report
+      --json            Emit one valid JSON document (no other stdout text)
+  -h, --help            Show help
+  -v, --version         Show version
+Examples:
+  sleuth example.com
+  sleuth https://example.com
+  sleuth https://example.com:8443/health -s
+  sleuth -c 192.168.1.50/24
+HELP
+}
+err() { printf 'Error: %s\n' "$1" >&2; exit 2; }
+valid_port() { [[ "$1" =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 )); }
+log() {
+  REPORT_TEXT+="$*\n"
+  [[ "$JSON_MODE" == true ]] || printf '%s\n' "$*"
+}
+parse_target() {
+  local parsed
+  if ! parsed="$(python3 - "$TARGET_INPUT" <<'PY'
+import ipaddress, re, sys
+from urllib.parse import urlsplit
+raw = sys.argv[1].strip()
+if not raw or any(ord(c) < 32 for c in raw): raise SystemExit(2)
+explicit = '://' in raw
+if not explicit: raw = 'http://' + raw
+u = urlsplit(raw)
+if u.scheme not in ('http', 'https') or not u.hostname or u.username or u.password:
+    raise SystemExit(2)
+host = u.hostname
+try:
+    ipaddress.IPv4Address(host)
+except ValueError:
+    # Do not let an invalid dotted-quad slip through as a DNS hostname.
+    if re.fullmatch(r'\d+(?:\.\d+){3}', host): raise SystemExit(2)
+    labels = host.rstrip('.').split('.')
+    if (len(host) > 253 or not labels or any(
+        not label or len(label) > 63 or not re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?', label)
+        for label in labels
+    )): raise SystemExit(2)
+try:
+    port = u.port
+except ValueError:
+    raise SystemExit(2)
+if port == 0: raise SystemExit(2)
+if port is None: port = 443 if u.scheme == 'https' else 80
+path = u.path or '/'
+if u.query: path += '?' + u.query
+print(f'{host}\t{u.scheme}\t{port}\t{path}\t{str(explicit).lower()}')
+PY
+)"; then
+    err "Invalid target '$TARGET_INPUT'. Use a hostname, IPv4 address, or valid HTTP(S) URL."
+  fi
+  IFS=$'\t' read -r TARGET SCHEME URL_PORT URL_PATH URL_EXPLICIT <<< "$parsed"
+  if [[ -n "$PORT" ]]; then
+    valid_port "$PORT" || err "Invalid port '$PORT'. Use 1-65535."
+    PORT=$((10#$PORT))
+    # For conventional web ports, make the scheme match the selected port.
+    case "$PORT" in
+      80|8080) SCHEME=http;;
+      443|8443) SCHEME=https;;
+    esac
+  else
+    PORT="$URL_PORT"
+  fi
+  # Keep conventional web ports consistent with the scheme, even for URLs.
+  case "$PORT" in
+    80|8080) SCHEME=http;;
+    443|8443) SCHEME=https;;
+  esac
+}
+validate_cidr() {
+  python3 - "$1" <<'PY' >/dev/null 2>&1 || err "Invalid CIDR '$1'. Use IPv4 address/prefix notation such as 192.168.1.10/24."
+import ipaddress, sys
+raw=sys.argv[1]
+if '/' not in raw: raise SystemExit(2)
+iface=ipaddress.ip_interface(raw)
+if not isinstance(iface, ipaddress.IPv4Interface): raise SystemExit(2)
+PY
+}
+calculate_cidr() {
+  python3 - "$1" "${2:-$JSON_MODE}" <<'PY'
+import ipaddress, json, sys
+iface=ipaddress.ip_interface(sys.argv[1]); n=iface.network
+if not isinstance(iface, ipaddress.IPv4Interface): raise SystemExit(2)
+if n.prefixlen == 32:
+    usable=1; first=last=str(n.network_address)
+elif n.prefixlen == 31:
+    usable=2; first=str(n.network_address); last=str(n.broadcast_address)
+else:
+    usable=max(n.num_addresses-2,0)
+    first=str(n.network_address+1) if usable else 'N/A'
+    last=str(n.broadcast_address-1) if usable else 'N/A'
+data={"cidr":str(iface),"subnet_mask":str(n.netmask),"network_address":str(n.network_address),
+      "broadcast_address":str(n.broadcast_address),"total_addresses":n.num_addresses,
+      "usable_host_ips":usable,"usable_range":{"first":first,"last":last}}
+if sys.argv[2] == 'true':
+    print(json.dumps(data, indent=2))
+else:
+    lines=[('CIDR:',data['cidr']),('Subnet Mask:',data['subnet_mask']),
+           ('Network Address:',data['network_address']),('Broadcast Address:',data['broadcast_address']),
+           ('Total Addresses:',str(data['total_addresses'])),('Usable Host IPs:',str(usable)),
+           ('Usable IP Range:',f'{first} -> {last}')]
+    for label,value in lines: print(f'{label:<18} {value}')
+PY
+}
+check_gateway() {
+  local route_entry=""
+  if command -v ip >/dev/null 2>&1; then route_entry="$(ip -4 route show default 2>/dev/null | head -n1 || true)"; fi
+  if [[ -n "$route_entry" ]]; then
+    GW_IP="$(awk '{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1);exit}}' <<< "$route_entry")"
+    GW_DEV="$(awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1);exit}}' <<< "$route_entry")"
+  fi
+  if [[ -z "$route_entry" ]]; then GW_OK="unknown"; log '[WARN] No IPv4 default route found.'; return; fi
+  if [[ -z "$GW_IP" ]]; then
+    GW_OK="unknown"
+    log "[INFO] Default route uses interface ${GW_DEV:-unknown} without an explicit gateway (common for VPN or point-to-point routes)."
+    return
+  fi
+  if ping -c 1 -W 1 "$GW_IP" >/dev/null 2>&1; then GW_OK=true; log "[PASS] Gateway $GW_IP responded to ICMP."; else GW_OK=false; log "[WARN] Gateway $GW_IP did not answer ICMP; this does not prove the gateway is down."; fi
+}
+check_dns() {
+  if [[ "$TARGET" =~ ^[0-9]+(\.[0-9]+){3}$ ]]; then DNS_LOCAL_OK=true; DNS_PUBLIC_OK="not_applicable"; return; fi
+  local resolved=""
+  if command -v getent >/dev/null 2>&1; then resolved="$(getent ahostsv4 "$TARGET" 2>/dev/null | awk 'NR==1{print $1}' || true)"; fi
+  if [[ -n "$resolved" ]]; then DNS_LOCAL_OK=true; log "[PASS] System resolver returned $resolved for $TARGET."; else DNS_LOCAL_OK=false; log "[FAIL] System resolver did not resolve $TARGET."; fi
+  if command -v dig >/dev/null 2>&1; then
+    local public=""; public="$(dig @1.1.1.1 +short +time=2 +tries=1 "$TARGET" A 2>/dev/null | awk '/^[0-9]+(\.[0-9]+){3}$/{print;exit}' || true)"
+    if [[ -n "$public" ]]; then DNS_PUBLIC_OK=true; log "[INFO] Public resolver 1.1.1.1 returned $public."; else DNS_PUBLIC_OK=false; log '[INFO] Public resolver 1.1.1.1 did not return an IPv4 address (direct DNS may be blocked).'; fi
+  else DNS_PUBLIC_OK="not_tested"; fi
+}
+check_ping() { if ping -c 1 -W 2 "$TARGET" >/dev/null 2>&1; then PING_OK=true; log '[PASS] Target responded to ICMP.'; else PING_OK=false; log '[WARN] Target did not answer ICMP; it may still be reachable because ICMP can be filtered.'; fi; }
+check_tcp() {
+  local result=""
+  result="$(python3 - "$TARGET" "$PORT" <<'PY'
+import errno, socket, sys, time
+host, port = sys.argv[1], int(sys.argv[2])
+try:
+    addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+except socket.gaierror:
+    print('false|dns_error'); raise SystemExit(0)
+deadline=time.monotonic()+4.0
+saw_refused=False; saw_timeout=False; saw_network_error=False
+for family, socktype, proto, _, address in addresses:
+    remaining=deadline-time.monotonic()
+    if remaining <= 0:
+        saw_timeout=True; break
+    sock=socket.socket(family, socktype, proto)
+    sock.settimeout(min(2.0, remaining))
+    try:
+        sock.connect(address)
+        sock.close()
+        print('true|none'); raise SystemExit(0)
+    except ConnectionRefusedError:
+        saw_refused=True
+    except socket.timeout:
+        saw_timeout=True
+    except OSError as exc:
+        if exc.errno == errno.ECONNREFUSED: saw_refused=True
+        elif exc.errno in (errno.ETIMEDOUT,): saw_timeout=True
+        else: saw_network_error=True
+    finally:
+        try: sock.close()
+        except OSError: pass
+if saw_refused and not saw_timeout and not saw_network_error: error='refused'
+elif saw_timeout: error='timeout'
+else: error='network_error'
+print(f'false|{error}')
+PY
+)"
+  IFS='|' read -r tcp_result TCP_ERR <<< "$result"
+  if [[ "$tcp_result" == true ]]; then TCP_OK=true; TCP_ERR=none; log "[PASS] TCP connection succeeded to $TARGET:$PORT."
+  else
+    TCP_OK=false
+    case "$TCP_ERR" in
+      refused) log '[WARN] TCP connection was refused; the destination actively rejected the connection.';;
+      timeout) log '[WARN] TCP connection timed out; filtering, routing, or an unresponsive service are possible.';;
+      dns_error) log '[WARN] TCP test could not resolve the target hostname.';;
+      *) TCP_ERR=network_error; log '[WARN] TCP connection failed due to a network/socket error; inspect the reported conditions before concluding why.';;
+    esac
+  fi
+}
+check_local_listeners() {
+  log '--- Local listening ports ---'
+  if command -v ss >/dev/null 2>&1; then
+    local output line
+    output="$(ss -tuln 2>/dev/null | awk 'NR==1 {print; next} NR<=11 {print}')"
+    while IFS= read -r line; do [[ -n "$line" ]] && log "$line"; done <<< "$output"
+  else log '[INFO] ss is not installed; skipping local listening-port summary.'; fi
+}
+check_http_tls() {
+  if [[ "$URL_EXPLICIT" != true && "$PORT" != 80 && "$PORT" != 443 && "$PORT" != 8080 && "$PORT" != 8443 ]]; then return; fi
+  command -v curl >/dev/null 2>&1 || { log '[WARN] curl is missing; skipping HTTP probe.'; return; }
+  local url data
+  url="$SCHEME://$TARGET:$PORT$URL_PATH"
+  data="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}|%{time_total}' --connect-timeout 3 --max-time 6 "$url" 2>/dev/null)" || true
+  if [[ "$data" == *'|'* ]]; then HTTP_CODE="${data%%|*}"; HTTP_TIME="${data#*|}"; else HTTP_CODE=000; HTTP_TIME=0.000; fi
+  if [[ "$HTTP_CODE" =~ ^[0-9]{3}$ && "$HTTP_CODE" != 000 ]]; then log "[INFO] HTTP response $HTTP_CODE in ${HTTP_TIME}s from $url."; else log '[WARN] No HTTP response received; inspect TCP, TLS, and application availability.'; fi
+  if [[ "$SCHEME" == https || "$PORT" == 443 || "$PORT" == 8443 ]]; then
+    local tls_out
+    tls_out="$(python3 "$SCRIPT_DIR/libexec/tls_inspector.py" "$TARGET" "$PORT" 2>/dev/null || true)"
+    if [[ -n "$tls_out" ]]; then
+      local tls_fields
+      tls_fields="$(python3 -c 'import json,sys; d=json.load(sys.stdin); print("\x1f".join(["valid" if d.get("connected") and not d.get("error") and not d.get("is_expired") else "error", d.get("tls_version") or "", d.get("cipher") or "", "" if d.get("days_left") is None else str(d.get("days_left")), d.get("error") or ""]))' <<< "$tls_out" 2>/dev/null || printf 'error\t\t\t\tTLS helper returned invalid JSON')"
+      IFS=$'\x1f' read -r TLS_STATUS TLS_VERSION TLS_CIPHER TLS_DAYS_LEFT TLS_ERROR <<< "$tls_fields"
+      [[ "$TLS_STATUS" == valid ]] && log "[PASS] TLS negotiated $TLS_VERSION; certificate checks passed." || log "[WARN] TLS inspection issue: ${TLS_ERROR:-details unavailable}."
+    else TLS_STATUS=error; TLS_ERROR='TLS helper returned no output'; log "[WARN] TLS inspection issue: $TLS_ERROR."; fi
+  fi
+}
+emit_json() {
+  python3 - "$TIMESTAMP" "$TARGET" "$SCHEME" "$PORT" "$GW_IP" "$GW_DEV" "$GW_OK" "$DNS_LOCAL_OK" "$DNS_PUBLIC_OK" "$PING_OK" "$TCP_OK" "$TCP_ERR" "$HTTP_CODE" "$HTTP_TIME" "$TLS_STATUS" "$TLS_VERSION" "$TLS_CIPHER" "$TLS_DAYS_LEFT" "$TLS_ERROR" <<'PY'
+import json,sys
+keys=['timestamp','target','scheme','port','gateway_ip','gateway_interface','gateway_reachable','dns_local_resolved','dns_public_resolved','icmp_ping','tcp_connected','tcp_error','http_code','http_time_seconds','tls_status','tls_version','tls_cipher','tls_days_left','tls_error']
+d=dict(zip(keys,sys.argv[1:]))
+d['port']=int(d['port'])
+for k in ('gateway_reachable','dns_local_resolved','dns_public_resolved','icmp_ping','tcp_connected'):
+    if d[k] in ('true','false'): d[k]=(d[k]=='true')
+    else: d[k]=None
+for k in ('gateway_ip','gateway_interface','tls_version','tls_cipher','tls_error'):
+    if d[k]=='': d[k]=None
+try: d['http_code']=int(d['http_code']) if d['http_code'] != '000' else None
+except ValueError: d['http_code']=None
+try: d['http_time_seconds']=float(d['http_time_seconds'])
+except ValueError: d['http_time_seconds']=None
+if d['tls_days_left']=='': d['tls_days_left']=None
+else: d['tls_days_left']=int(d['tls_days_left'])
+print(json.dumps(d,indent=2))
+PY
+}
+save_text_report() {
+  local target_safe report_file
+  target_safe="${TARGET:-cidr}"; target_safe="${target_safe//[^A-Za-z0-9_.-]/_}"
+  mkdir -p "$SCRIPT_DIR/reports" || err 'Could not create reports directory.'
+  chmod 700 "$SCRIPT_DIR/reports" 2>/dev/null || true
+  report_file="$SCRIPT_DIR/reports/sleuth_${target_safe}_${FILE_TIMESTAMP}.txt"
+  printf '%b' "$REPORT_TEXT" > "$report_file"
+  [[ "$JSON_MODE" == true ]] || printf 'Report saved to: %s\n' "$report_file"
+}
+main() {
+  while (($#)); do
+    case "$1" in
+      -p|--port) (($# >= 2)) || err "Option $1 requires a port."; PORT="$2"; shift 2;;
+      -c|--cidr) (($# >= 2)) || err "Option $1 requires a CIDR."; CIDR="$2"; shift 2;;
+      -s|--save-report) SAVE_REPORT=true; shift;;
+      --json) JSON_MODE=true; shift;;
+      -h|--help) usage; exit 0;; -v|--version) echo "NetSleuth $VERSION"; exit 0;;
+      -*) err "Unknown option '$1'. Use --help.";;
+      *) [[ -z "$TARGET_INPUT" ]] || err 'Only one target may be supplied.'; TARGET_INPUT="$1"; shift;;
+    esac
+  done
+  FILE_TIMESTAMP="$(date -u '+%Y%m%d_%H%M%SZ')"
+  if [[ -n "$CIDR" ]]; then
+    validate_cidr "$CIDR"
+    if [[ "$SAVE_REPORT" == true ]]; then
+      TARGET="cidr_${CIDR//[^A-Za-z0-9_.-]/_}"
+      REPORT_TEXT="NetSleuth $VERSION | $(date -u '+%Y-%m-%dT%H:%M:%SZ')\nCIDR calculation\n"
+      REPORT_TEXT+="$(calculate_cidr "$CIDR" false)\n"
+      if [[ "$JSON_MODE" == true ]]; then calculate_cidr "$CIDR" true; else printf '%b' "$REPORT_TEXT"; fi
+      save_text_report
+    else calculate_cidr "$CIDR" "$JSON_MODE"; fi
+    return
+  fi
+  [[ -n "$TARGET_INPUT" ]] || { usage >&2; err 'Missing target.'; }
+  command -v python3 >/dev/null 2>&1 || err 'Python 3 is required.'
+  parse_target
+  TIMESTAMP="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  log "NetSleuth $VERSION | $TIMESTAMP"; log "Target: $TARGET | Scheme: $SCHEME | Port: $PORT"
+  log '--- Gateway ---'; check_gateway; log '--- DNS ---'; check_dns; log '--- ICMP ---'; check_ping; log '--- TCP ---'; check_tcp; log '--- HTTP/TLS ---'; check_http_tls; check_local_listeners
+  log '--- Assessment ---'
+  if [[ "$DNS_LOCAL_OK" == false ]]; then log 'Assessment: name resolution failed; verify the hostname and configured resolver.'
+  elif [[ "$TCP_OK" == false ]]; then log "Assessment: TCP connection failed ($TCP_ERR); this alone does not establish the root cause."
+  elif [[ "$HTTP_CODE" == 000 ]]; then log 'Assessment: no HTTP response was obtained; check whether the target is an HTTP service.'
+  elif [[ "$HTTP_CODE" =~ ^[45] ]]; then log "Assessment: the server returned HTTP $HTTP_CODE; network connectivity may work while the application reports an error."
+  else log 'Assessment: available checks completed. Review each result; a successful probe does not guarantee the whole service is healthy.'; fi
+  if [[ "$JSON_MODE" == true ]]; then emit_json; fi
+  if [[ "$SAVE_REPORT" == true ]]; then save_text_report; fi
+}
+main "$@"
